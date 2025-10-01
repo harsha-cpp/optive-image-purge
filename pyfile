@@ -1,0 +1,607 @@
+import os
+import re
+from typing import List, Tuple, Dict, Any, Set
+
+import cv2
+import numpy as np
+import easyocr
+
+# Optional PII NER (installed via requirements). Falls back gracefully if unavailable
+try:
+    from presidio_analyzer import AnalyzerEngine
+    from presidio_analyzer.nlp_engine import NlpEngineProvider
+    import spacy
+    _HAS_PRESIDIO = True
+except Exception:
+    _HAS_PRESIDIO = False
+
+# Optional Gemini classification to reduce false positives
+try:
+    import google.generativeai as genai
+    _HAS_GEMINI = True
+except Exception:
+    _HAS_GEMINI = False
+
+
+def _blur_region(image: np.ndarray, box: Tuple[int, int, int, int]) -> None:
+    """
+    Apply a Gaussian blur to the specified rectangular region in place.
+
+    Args:
+        image: Numpy image array in BGR color space.
+        box: Tuple of (x, y, w, h) defining the region to blur.
+    """
+    x, y, w, h = box
+    x_end = min(x + w, image.shape[1])
+    y_end = min(y + h, image.shape[0])
+    x = max(x, 0)
+    y = max(y, 0)
+    roi = image[y:y_end, x:x_end]
+    if roi.size == 0:
+        return
+    # Kernel size must be odd and positive; scale with region size
+    kx = max(11, (w // 5) * 2 + 1)
+    ky = max(11, (h // 5) * 2 + 1)
+    blurred = cv2.GaussianBlur(roi, (kx, ky), 0)
+    image[y:y_end, x:x_end] = blurred
+
+
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+HANDLE_RE = re.compile(r"(^|\s)@[A-Za-z0-9_\.]{2,}")
+PHONE_RE = re.compile(r"(\+?\d[\d\s\-()]{8,}\d)")
+ID_LIKE_RE = re.compile(r"(?=.*\d)[A-Za-z0-9\-_/]{5,}")
+ADDRESS_RE = re.compile(r"\b(\d{1,6}\s+)?([A-Za-z]+\s+){0,6}(street|st\.?|lane|ln\.?|road|rd\.?|avenue|ave\.?|blvd\.?|drive|dr\.?|way|court|ct\.?|circle|cir\.?|parkway|pkwy\.?|place|pl\.?|terrace|ter\.?|highway|hwy\.?|square|sq\.?)\b", re.I)
+LONG_NUMBER_RE = re.compile(r"(?<!\d)(?:\d[ \-()]{0,2}){10,}(?!\d)")
+BANK_KEYWORDS = ["bank", "iban", "ifsc", "swift", "routing", "account", "acct", "micr"]
+BANK_KEYWORDS_RE = re.compile(r"\b(?:" + "|".join(re.escape(k) for k in BANK_KEYWORDS) + r")\b", re.I)
+
+# Organization/Institution keywords (schools, restaurants, companies)
+ORGANIZATION_KEYWORDS = ["school", "college", "university", "restaurant", "cafe", "hotel", "company", "corporation", "corp", "inc", "ltd", "llc", "elementary", "high school", "academy"]
+ORGANIZATION_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in ORGANIZATION_KEYWORDS) + r")\b", re.I)
+
+# Job titles that when paired with names should be redacted
+JOB_TITLES = ["manager", "director", "ceo", "cto", "cfo", "president", "vice president", "supervisor", "administrator", "principal", "teacher", "professor", "officer"]
+JOB_TITLE_RE = re.compile(r"\b(" + "|".join(re.escape(k) for k in JOB_TITLES) + r")\b", re.I)
+
+
+LABEL_KEYWORDS = [
+    "id", "employee id", "emp id", "issue date", "issued", "expiry",
+    "expiration", "license", "licence", "dob", "date of birth", "phone",
+    "mobile", "contact", "email", "account", "number", "no.", "code",
+    "name", "student name", "full name", "applicant name", "parent",
+    "guardian", "signature"
+]
+
+NAME_LABELS = {
+    "name",
+    "student name",
+    "full name",
+    "applicant name",
+    "student's name",
+    "parent",
+    "guardian",
+    "signature",
+}
+
+
+def _normalize_label(text: str) -> str:
+    return (text or "").strip().lower().rstrip(":")
+
+
+def _token_matches_sensitive_patterns(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    if EMAIL_RE.search(t):
+        return True
+    if HANDLE_RE.search(t):
+        return True
+    if PHONE_RE.search(t):
+        return True
+    if LONG_NUMBER_RE.search(t):
+        return True
+    if ID_LIKE_RE.search(t):
+        return True
+    if ADDRESS_RE.search(t):
+        return True
+    if ORGANIZATION_RE.search(t):
+        return True
+    if JOB_TITLE_RE.search(t):
+        return True
+    return False
+
+
+def _looks_like_name_token(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if not t or " " in t:
+        return False
+    if not t[0].isalpha() or not t[0].isupper():
+        return False
+    if len(t) == 1:
+        return True
+    return t[1:].islower()
+
+
+def _is_value_like_token(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    if _token_matches_sensitive_patterns(t):
+        return True
+    digit_count = sum(ch.isdigit() for ch in t)
+    if digit_count >= 2:
+        return True
+    if any(ch in t for ch in "@#$/\\-_"):
+        return True
+    if t.isupper() and any(ch.isalpha() for ch in t) and len(t) > 3:
+        return True
+    return False
+
+
+def _contains_bank_keyword(text: str) -> bool:
+    if not text:
+        return False
+    return bool(BANK_KEYWORDS_RE.search(text))
+
+
+def _should_blur_for_label(label: str, candidate_text: str) -> bool:
+    candidate = (candidate_text or "").strip()
+    if not candidate:
+        return False
+    normalized_label = _normalize_label(label)
+    if normalized_label in NAME_LABELS:
+        return _looks_like_name_token(candidate) or _is_value_like_token(candidate)
+    if normalized_label in {"email", "mail", "e-mail"}:
+        return "@" in candidate or EMAIL_RE.search(candidate) is not None
+    if normalized_label in {"phone", "mobile", "contact", "tel", "telephone"}:
+        return PHONE_RE.search(candidate) is not None or sum(ch.isdigit() for ch in candidate) >= 6
+    if normalized_label in {"dob", "date of birth", "issue date", "issued", "expiry", "expiration"}:
+        return any(ch.isdigit() for ch in candidate)
+    if normalized_label in {"account", "acct", "account number", "number", "no.", "code", "id", "employee id", "emp id"}:
+        return _is_value_like_token(candidate)
+    return _is_value_like_token(candidate)
+
+
+def _contains_sensitive_text(text: str, instructions: str) -> bool:
+    """
+    Decide whether text should be redacted based on simple heuristics.
+
+    Current heuristic:
+    - Any token containing a digit 0-9
+    - Currency indicators ($, €, £, ₹) or percentage signs
+    - Optional: honor keywords from instructions (best-effort)
+    """
+    if not text:
+        return False
+    t = text.strip()
+    if not t:
+        return False
+    # Obvious PII patterns
+    if EMAIL_RE.search(t):
+        return True
+    if HANDLE_RE.search(t):
+        return True
+    if PHONE_RE.search(t):
+        return True
+    if ID_LIKE_RE.search(t):
+        return True
+    # If instructions mention prices/quantities specifically, hide numbers-like words
+    lowered = (instructions or "").lower()
+    if any(k in lowered for k in ["email", "phone", "id", "date", "account", "code", "handle"]):
+        if re.fullmatch(r"[A-Za-z]{2,}", t):
+            # single words alone not redacted unless label-driven (handled later)
+            return False
+    return False
+
+
+def _group_by_lines(results: List[Any]) -> List[List[Tuple[List[Tuple[int, int]], str, float]]]:
+    """
+    Cluster OCR results into lines by y-center proximity, then sort left-to-right.
+    Returns a list of lines, each a list of (bbox_points, text, conf).
+    """
+    # Compute y-center for each box
+    items: List[Tuple[float, Any]] = []
+    for item in results:
+        bbox, text, conf = item
+        ys = [p[1] for p in bbox]
+        y_center = float(sum(ys) / 4.0)
+        items.append((y_center, item))
+
+    items.sort(key=lambda x: x[0])
+    lines: List[List[Any]] = []
+    threshold = 14.0  # pixels tolerance between lines
+    for y_center, item in items:
+        if not lines:
+            lines.append([item])
+            continue
+        last_line = lines[-1]
+        last_y = sum(p[1] for p in last_line[0][0]) / 4.0
+        if abs(y_center - last_y) <= threshold:
+            last_line.append(item)
+        else:
+            lines.append([item])
+
+    # sort each line left-to-right
+    sorted_lines: List[List[Any]] = []
+    for line in lines:
+        line.sort(key=lambda it: min(p[0] for p in it[0]))
+        sorted_lines.append(line)
+    return sorted_lines
+
+
+def _is_label_word(word: str) -> bool:
+    w = word.strip().lower().rstrip(":")
+    return any(w == k or w in k.split() for k in LABEL_KEYWORDS)
+
+
+def _build_presidio_analyzer() -> AnalyzerEngine:
+    """Create AnalyzerEngine pinned to en_core_web_sm to avoid large downloads."""
+    if not _HAS_PRESIDIO:
+        return None  # type: ignore
+    try:
+        _ = spacy.load("en_core_web_sm")
+    except Exception:
+        from spacy.cli import download
+        download("en_core_web_sm")
+    provider = NlpEngineProvider(nlp_configuration={
+        "nlp_engine_name": "spacy",
+        "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}],
+    })
+    nlp_engine = provider.create_engine()
+    return AnalyzerEngine(nlp_engine=nlp_engine)
+
+
+def _pii_entities_from_lines(lines: List[List[Any]]) -> List[Dict[str, Any]]:
+    """
+    Use Presidio+spaCy to detect PII on line strings; return list of detections
+    with mapping back to line index and character span.
+    """
+    if not _HAS_PRESIDIO:
+        return []
+
+    analyzer = _build_presidio_analyzer()
+    if analyzer is None:
+        return []
+    detections: List[Dict[str, Any]] = []
+    for line_idx, line in enumerate(lines):
+        # Build line string and char index map per token
+        pieces: List[str] = []
+        spans: List[Tuple[int, int, int]] = []  # (start, end, token_idx)
+        cursor = 0
+        for token_idx, (bbox, text, conf) in enumerate(line):
+            t = (text or "").strip()
+            if token_idx > 0:
+                pieces.append(" ")
+                cursor += 1
+            pieces.append(t)
+            spans.append((cursor, cursor + len(t), token_idx))
+            cursor += len(t)
+
+        line_text = "".join(pieces)
+        if not line_text:
+            continue
+        results = analyzer.analyze(
+            text=line_text,
+            language="en",
+            entities=[
+                "PERSON",
+                "EMAIL_ADDRESS",
+                "PHONE_NUMBER",
+                "LOCATION",
+                "ORGANIZATION",
+                "NRP",
+                "IBAN_CODE",
+                "CREDIT_CARD",
+                "US_SSN",
+                "DATE_TIME",
+            ],
+        )
+        for r in results:
+            # Map char span to token indexes on this line
+            for start, end, token_idx in spans:
+                if not (r.end <= start or r.start >= end):
+                    detections.append({
+                        "line_idx": line_idx,
+                        "token_idx": token_idx,
+                        "entity_type": r.entity_type,
+                        "score": r.score,
+                    })
+    return detections
+
+
+def _match_cross_token_patterns(lines: List[List[Any]]) -> List[Dict[str, int]]:
+    """
+    Detect emails/phones/long numbers/addresses that are split across tokens.
+    Returns list of { line_idx, token_idx } to blur.
+    """
+    hits: List[Dict[str, int]] = []
+    for li, line in enumerate(lines):
+        # Build text and token boundaries
+        tokens = [(bbox, (text or "").strip()) for bbox, text, _ in line]
+        if not tokens:
+            continue
+        pieces: List[str] = []
+        spans: List[Tuple[int, int, int]] = []
+        cur = 0
+        for idx, (_, t) in enumerate(tokens):
+            if idx > 0:
+                pieces.append(" ")
+                cur += 1
+            pieces.append(t)
+            spans.append((cur, cur + len(t), idx))
+            cur += len(t)
+        txt = "".join(pieces)
+        # Search patterns on the joined text
+        patterns = [EMAIL_RE, PHONE_RE, LONG_NUMBER_RE, ADDRESS_RE]
+        for pat in patterns:
+            for m in pat.finditer(txt):
+                ms, me = m.start(), m.end()
+                for s, e, ti in spans:
+                    if not (me <= s or ms >= e):
+                        hits.append({"line_idx": li, "token_idx": ti})
+    return hits
+
+
+def _gemini_select_sensitive_tokens(lines: List[List[Any]], instructions: str, api_key: str) -> List[Dict[str, int]]:
+    """
+    Send OCR tokens as JSON to Gemini to select sensitive tokens. Returns list of
+    { line_idx, token_idx } dicts to blur.
+    """
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        import json
+        payload_lines = []
+        for li, line in enumerate(lines):
+            payload_tokens = []
+            for ti, (bbox, text, conf) in enumerate(line):
+                payload_tokens.append({"idx": int(ti), "text": (text or "").strip()})
+            payload_lines.append({"idx": int(li), "tokens": payload_tokens})
+        payload = {"lines": payload_lines}
+        system_prompt = (
+            "Decide which OCR tokens contain PII based on the user instructions. "
+            "Return ONLY JSON with an array of objects: {\"line_idx\": int, \"token_idx\": int}."
+        )
+        user_prompt = (
+            f"Instructions:\n{instructions}\n\n"
+            f"OCR tokens (as JSON):\n{json.dumps(payload)}\n\n"
+            "Output JSON array only, no extra text."
+        )
+        resp = model.generate_content(system_prompt + "\n\n" + user_prompt)
+        text = getattr(resp, "text", None)
+        if not text:
+            return []
+        # Extract JSON array
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1:
+            return []
+        data = json.loads(text[start:end+1])
+        results: List[Dict[str, int]] = []
+        for item in data:
+            try:
+                li = int(item.get("line_idx", -1))
+                ti = int(item.get("token_idx", -1))
+                if li >= 0 and ti >= 0:
+                    results.append({"line_idx": li, "token_idx": ti})
+            except Exception:
+                continue
+        return results
+    except Exception:
+        return []
+
+
+def anonymize_image(input_path: str, output_path: str, instructions: str) -> None:
+    """
+    Anonymize an image locally by OCR-detecting sensitive text and blurring it.
+
+    Args:
+        input_path: Path to input image file.
+        output_path: Path to write redacted image file.
+        instructions: Natural-language guidance (currently heuristic-based).
+    """
+    try:
+        # Read image with OpenCV (BGR)
+        image_bgr = cv2.imread(input_path)
+        if image_bgr is None:
+            print(f"Failed to read image: {input_path}")
+            return
+
+        # Run EasyOCR (English by default; add more langs if needed)
+        reader = easyocr.Reader(['en'], gpu=False)
+        results = reader.readtext(image_bgr)
+        
+        print(f"\n{'='*60}")
+        print(f"OCR Results for: {input_path}")
+        print(f"{'='*60}")
+
+        lines = _group_by_lines(results)
+        
+        print("\nExtracted text by line:")
+        for li, line in enumerate(lines):
+            line_text = " ".join(text.strip() for _, text, _ in line if text)
+            print(f"  Line {li}: {line_text}")
+
+        tokens_by_line: List[List[Dict[str, Any]]] = []
+        for li, line in enumerate(lines):
+            line_tokens: List[Dict[str, Any]] = []
+            for ti, (bbox, text, conf) in enumerate(line):
+                raw_text = str(text or "")
+                xs = [int(p[0]) for p in bbox]
+                ys = [int(p[1]) for p in bbox]
+                x = max(min(xs), 0)
+                y = max(min(ys), 0)
+                w = max(max(xs) - x, 1)
+                h = max(max(ys) - y, 1)
+                line_tokens.append({
+                    "bbox": bbox,
+                    "text": raw_text.strip(),
+                    "raw_text": raw_text,
+                    "line_idx": li,
+                    "token_idx": ti,
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "conf": conf,
+                })
+            tokens_by_line.append(line_tokens)
+
+        to_blur: Set[Tuple[int, int]] = set()
+
+        def mark_token(line_idx: int, token_idx: int) -> None:
+            if line_idx < 0 or token_idx < 0:
+                return
+            if line_idx >= len(tokens_by_line):
+                return
+            if token_idx >= len(tokens_by_line[line_idx]):
+                return
+            to_blur.add((line_idx, token_idx))
+
+        # 1) Direct pattern-based hits per token
+        print("\n[1] Pattern-based detection:")
+        pattern_hits = 0
+        for li, line_tokens in enumerate(tokens_by_line):
+            for tok in line_tokens:
+                if _token_matches_sensitive_patterns(tok["text"]):
+                    print(f"  ✓ Pattern match: '{tok['text']}' at line {li}, token {tok['token_idx']}")
+                    mark_token(li, tok["token_idx"])
+                    pattern_hits += 1
+        print(f"  Total pattern hits: {pattern_hits}")
+
+        # 2) Label -> value targeting with tighter heuristics
+        for li, line_tokens in enumerate(tokens_by_line):
+            for idx, tok in enumerate(line_tokens):
+                label_text = tok["text"]
+                if not label_text:
+                    continue
+                if not _is_label_word(label_text):
+                    continue
+                normalized_label = _normalize_label(label_text)
+                label_right_edge = tok["x"] + tok["w"] + 6
+                values_found = 0
+                for j in range(idx + 1, len(line_tokens)):
+                    candidate = line_tokens[j]
+                    if candidate["x"] < label_right_edge:
+                        continue
+                    cand_text = candidate["text"]
+                    if not cand_text:
+                        continue
+                    stripped = cand_text.strip()
+                    if stripped in {":", "-", "–", "—"}:
+                        continue
+                    if _is_label_word(cand_text):
+                        break
+                    if _should_blur_for_label(normalized_label, cand_text):
+                        mark_token(li, candidate["token_idx"])
+                        values_found += 1
+                        if normalized_label not in NAME_LABELS and values_found >= 3:
+                            break
+                    else:
+                        if values_found > 0 or (cand_text.isalpha() and normalized_label not in NAME_LABELS):
+                            break
+
+        # 3) Bank keywords with bounded look-ahead
+        for li, line_tokens in enumerate(tokens_by_line):
+            for idx, tok in enumerate(line_tokens):
+                current_text = tok["text"]
+                if not current_text:
+                    continue
+                if _contains_bank_keyword(current_text):
+                    cleaned = current_text.strip()
+                    if any(ch.isdigit() for ch in cleaned) or ":" in cleaned:
+                        mark_token(li, tok["token_idx"])
+                    window = 3
+                    for j in range(idx + 1, min(idx + 1 + window, len(line_tokens))):
+                        candidate = line_tokens[j]
+                        cand_text = candidate["text"]
+                        if not cand_text:
+                            continue
+                        if _is_label_word(cand_text):
+                            break
+                        if _is_value_like_token(cand_text):
+                            mark_token(li, candidate["token_idx"])
+                        elif cand_text.isalpha():
+                            break
+
+        # 4) Gemini-assisted token selection (optional but preferred)
+        api_key = os.getenv("GEMINI_API_KEY")
+        if _HAS_GEMINI and api_key:
+            print("\n[4] Gemini-assisted token selection:")
+            selections = _gemini_select_sensitive_tokens(lines, instructions, api_key)
+            print(f"  Gemini selected {len(selections)} tokens")
+            for sel in selections:
+                li = int(sel.get("line_idx", -1))
+                ti = int(sel.get("token_idx", -1))
+                if li >= 0 and li < len(tokens_by_line) and ti >= 0 and ti < len(tokens_by_line[li]):
+                    token_text = tokens_by_line[li][ti]["text"]
+                    print(f"  ✓ Gemini: '{token_text}' at line {li}, token {ti}")
+                mark_token(li, ti)
+        else:
+            print("\n[4] Gemini-assisted selection skipped (missing GEMINI_API_KEY or package).")
+
+        # 5) NER-driven PII redaction using Presidio (names, addresses, etc.)
+        print("\n[5] NER-based detection (Presidio):")
+        if _HAS_PRESIDIO:
+            ner_hits = _pii_entities_from_lines(lines)
+            print(f"  Presidio detected {len(ner_hits)} entities")
+            for hit in ner_hits:
+                li = hit["line_idx"]
+                ti = hit["token_idx"]
+                if li >= 0 and li < len(tokens_by_line) and ti >= 0 and ti < len(tokens_by_line[li]):
+                    token_text = tokens_by_line[li][ti]["text"]
+                    entity_type = hit.get("entity_type", "UNKNOWN")
+                    print(f"  ✓ NER ({entity_type}): '{token_text}' at line {li}, token {ti}")
+                mark_token(li, ti)
+        else:
+            print("  Presidio not available")
+
+        # 6) Cross-token pattern detection (emails/phones/etc. split over tokens)
+        print("\n[6] Cross-token pattern detection:")
+        cross_hits = _match_cross_token_patterns(lines)
+        print(f"  Cross-token matches: {len(cross_hits)}")
+        for hit in cross_hits:
+            li = hit["line_idx"]
+            ti = hit["token_idx"]
+            if li >= 0 and li < len(tokens_by_line) and ti >= 0 and ti < len(tokens_by_line[li]):
+                token_text = tokens_by_line[li][ti]["text"]
+                print(f"  ✓ Cross-token: '{token_text}' at line {li}, token {ti}")
+            mark_token(li, ti)
+
+        # 7) Fallback name heuristic when NER unavailable but instructions request it
+        instructions_lower = (instructions or "").lower()
+        if not _HAS_PRESIDIO and "name" in instructions_lower:
+            for li, line_tokens in enumerate(tokens_by_line[:5]):
+                for idx in range(len(line_tokens) - 1):
+                    t1 = line_tokens[idx]["text"]
+                    t2 = line_tokens[idx + 1]["text"]
+                    if _looks_like_name_token(t1) and _looks_like_name_token(t2):
+                        mark_token(li, line_tokens[idx]["token_idx"])
+                        mark_token(li, line_tokens[idx + 1]["token_idx"])
+
+        # Apply blurs once per target token
+        for li, ti in sorted(to_blur):
+            if li >= len(tokens_by_line):
+                continue
+            line_tokens = tokens_by_line[li]
+            if ti >= len(line_tokens):
+                continue
+            tok = line_tokens[ti]
+            _blur_region(image_bgr, (tok["x"], tok["y"], tok["w"], tok["h"]))
+
+        # Save result
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        success = cv2.imwrite(output_path, image_bgr)
+        if success:
+            print(f"Anonymized image saved to {output_path}")
+        else:
+            print(f"Failed to save output image to {output_path}")
+
+    except Exception as e:
+        print(f"An error occurred while processing {input_path}: {e}")

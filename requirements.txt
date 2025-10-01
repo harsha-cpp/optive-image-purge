@@ -1,0 +1,11 @@
+opencv-python-headless
+easyocr
+numpy
+pillow
+python-dotenv
+presidio-analyzer
+spacy
+google-generativeai
+fastapi
+uvicorn[standard]
+python-multipart
